@@ -1,0 +1,625 @@
+---
+title: "Wildfire Prediction Analysis"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+
+## Libraries {#libraries}
+
+```{r libraries}
+
+library(RSQLite)
+library(dbplyr)
+library(tidyverse)
+library(caret)
+library(rpart.plot)
+library(knitr)
+library(kableExtra)
+library(e1071)
+```
+
+## Getting the Data {#get_data}
+
+
+```{r load_data}
+
+# create db connection
+conn <- dbConnect(SQLite(), 'FPA_FOD_20170508.sqlite')
+
+
+# pull the fires table into RAM
+fires <- tbl(conn, "Fires") %>% collect()
+
+# disconnect from db
+dbDisconnect(conn)
+
+```
+
+```{r, echo = FALSE}
+
+# check size
+print("Size of data in RAM:")
+print(object.size(fires), units = 'Gb')
+
+```
+
+```{r}
+
+print(dim(fires))
+
+```
+
+The dataframe is a little under 1Gb in size and has 1.88 million rows. 
+
+## Sampling the Data {#sample}
+
+
+```{r sample_data}
+
+# Randomly sample observations from the data
+set.seed(123)
+index <- sample(c(TRUE, FALSE), nrow(fires), replace = TRUE, prob = c(0.1, 0.9))
+fires <- fires[index, ]
+
+```
+
+## Target Feature Analysis {#target}
+
+
+
+```{r plot_classes}
+
+fires %>% group_by(STAT_CAUSE_DESCR) %>%
+    summarize(n = n()) %>%
+    ggplot(aes(x = reorder(STAT_CAUSE_DESCR, -n), y = n/1000)) + 
+    geom_bar(stat = 'identity', fill = 'orange') + 
+    labs(x = '', y = '# of instances (thousands)', title = 'Target class counts') + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+## Data Setup {#data_setup}
+
+
+
+```{r train_test_split}
+
+# features to use
+features <- c('FIRE_SIZE')
+
+fires$STAT_CAUSE_DESCR <- as.factor(fires$STAT_CAUSE_DESCR)
+
+# index for train/test split
+set.seed(123)
+train_index <- sample(c(TRUE, FALSE), nrow(fires), replace = TRUE, prob = c(0.8, 0.2))
+test_index <- !train_index
+
+# Create x/y, train/test data
+x_train <- as.data.frame(fires[train_index, features])
+y_train <- fires$STAT_CAUSE_DESCR[train_index]
+
+x_test <- as.data.frame(fires[test_index, features])
+y_test <- fires$STAT_CAUSE_DESCR[test_index]
+
+
+```
+
+## Iteration 1: Benchmark {#benchmark}
+
+
+
+```{r benchmark}
+
+preds <- rep('Debris Burning', length(y_test))
+
+test_set_acc <- round(sum(y_test == preds)/length(preds), 4)
+print(paste(c("Accuracy:" , test_set_acc)))
+
+```
+
+
+
+## Iteration 2: A Simple Decision Tree {#simple}
+
+
+```{r, tree_1}
+
+# create the training control object.
+tr_control <- trainControl(method = 'cv', number = 3)
+
+# Train the decision tree model
+set.seed(123)
+dtree <- train(x = x_train,
+               y = y_train,
+               method = 'rpart',
+               trControl = tr_control)
+
+```
+
+```{r predictions_1}
+
+# make predictions using test set
+preds <- predict(dtree, newdata = x_test)
+
+# calculate accuracy on test set
+test_set_acc <- round(sum(y_test == preds)/length(preds), 4)
+print(paste(c("Accuracy:" , test_set_acc)))
+
+```
+
+
+```{r tree_resample_1}
+
+print(dtree$resample)
+
+```
+
+
+### Results {.tabset}
+
+#### Confusion Matrix Heatmap
+
+```{r conf_heatmap_1}
+
+confusionMatrix(y_test, preds)$table %>%
+    prop.table(margin = 1) %>%
+    as.data.frame.matrix() %>%
+    rownames_to_column(var = 'actual') %>%
+    gather(key = 'prediction', value = 'freq',-actual) %>%
+    ggplot(aes(x = actual, y = prediction, fill = freq)) +
+    geom_tile() +
+    geom_text(aes(label = round(freq, 2)), size = 3, color = 'gray20') + 
+    scale_fill_gradient(high = 'Red', low = 'Yellow', limits = c(0,1), name = 'Relative Frequency') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    ggtitle('Confusion Matrix - Simple Decision Tree')
+    
+
+```
+
+
+#### Confusion Matrix Table
+
+```{r conf_table_1}
+
+# show confusion matrix
+confusionMatrix(y_test, preds)$table %>%
+    as.data.frame.matrix() %>%
+    kable("html") %>%
+    kable_styling(bootstrap_options = c('striped'), font_size = 8) %>%
+    scroll_box(height = "400px")
+
+```
+
+
+#### Tree Plot
+
+
+
+```{r tree_plot_1}
+
+rpart.plot(dtree$finalModel)
+
+```
+
+
+#### CV Plot
+
+```{r}
+
+plot(dtree)
+
+```
+
+
+
+## Iteration 3: Moar Features! {#moar}
+
+
+
+```{r train_test_split_1}
+
+# features to use
+features <- c('FIRE_YEAR', 'FIRE_SIZE', 'DISCOVERY_DOY')
+
+x_train <- as.data.frame(fires[train_index, features])
+y_train <- fires$STAT_CAUSE_DESCR[train_index]
+
+x_test <- as.data.frame(fires[test_index, features])
+y_test <- fires$STAT_CAUSE_DESCR[test_index]
+
+```
+
+
+```{r tree_2}
+
+# Train the decision tree model
+set.seed(123)
+
+dtree <- train(x = x_train,
+               y = y_train,
+               method = 'rpart',
+               tuneLength = 5,
+               trControl = tr_control)
+
+```
+
+```{r predictions_2}
+
+# make predictions using test set
+preds <- predict(dtree, newdata = x_test)
+
+# calculate accuracy on test set
+test_set_acc <- sum(y_test == preds)/length(preds)
+print(paste(c("Accuracy:" , round(test_set_acc, 4))))
+
+```
+
+
+
+```{r resample_2}
+
+print(dtree$resample)
+
+```
+
+
+
+### Results {.tabset}
+
+#### Confusion Matrix Heatmap
+
+```{r conf_heatmap_2}
+
+confusionMatrix(y_test, preds)$table %>%
+    prop.table(margin = 1) %>%
+    as.data.frame.matrix() %>%
+    rownames_to_column(var = 'actual') %>%
+    gather(key = 'prediction', value = 'freq',-actual) %>%
+    ggplot(aes(x = actual, y = prediction, fill = freq)) +
+    geom_tile() +
+    geom_text(aes(label = round(freq, 2)), size = 3, color = 'gray20') + 
+    scale_fill_gradient(low = 'yellow', high = 'red', limits = c(0,1), name = 'Relative Frequency') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle('Confusion Matrix - Decision Tree')
+    
+```
+
+#### Confusion Matrix Table
+
+```{r conf_table_2}
+# show confusion matrix
+confusionMatrix(y_test, preds)$table %>%
+    as.data.frame.matrix() %>%
+    kable("html") %>%
+    kable_styling(bootstrap_options = c('striped'), font_size = 8) %>%
+    scroll_box(height = "400px")
+
+```
+
+
+
+
+#### Tree Plot
+
+
+
+```{r tree_plot_2}
+
+rpart.plot(dtree$finalModel)
+
+```
+
+
+
+#### CV Plot
+
+```{r}
+
+plot(dtree)
+
+```
+
+## Iteration 4: Even More Features {#even_more}
+
+
+```{r, train_test_split_3}
+
+# features to use
+features <- c('FIRE_YEAR', 'FIRE_SIZE', 'DISCOVERY_DOY', 'LATITUDE', 'LONGITUDE')
+
+x_train <- as.data.frame(fires[train_index, features])
+y_train <- fires$STAT_CAUSE_DESCR[train_index]
+
+x_test <- as.data.frame(fires[test_index, features])
+y_test <- fires$STAT_CAUSE_DESCR[test_index]
+
+```
+
+
+
+```{r tree_3}
+
+# Train the decision tree model
+set.seed(123)
+dtree <- train(x = x_train,
+               y = y_train,
+               method = 'rpart',
+               tuneLength = 8,
+               trControl = tr_control)
+
+```
+
+```{r predictions_3}
+
+# make predictions using test set
+preds <- predict(dtree, newdata = x_test)
+
+# calculate accuracy on test set
+test_set_acc <- sum(y_test == preds)/length(preds)
+print(paste(c("Accuracy:" , round(test_set_acc, 4))))
+
+
+```
+
+
+
+### Results {.tabset}
+
+#### Confusion Matrix Heatmap
+
+```{r conf_heatmap_3}
+
+confusionMatrix(y_test, preds)$table %>%
+    prop.table(margin = 1) %>%
+    as.data.frame.matrix() %>%
+    rownames_to_column(var = 'actual') %>%
+    gather(key = 'prediction', value = 'freq',-actual) %>%
+    ggplot(aes(x = actual, y = prediction, fill = freq)) +
+    geom_tile() + 
+    geom_text(aes(label = round(freq, 2)), size = 3, color = 'gray20') + 
+    scale_fill_gradient(low = 'yellow', high = 'red', limits = c(0,1), name = 'Relative Frequency') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    ggtitle('Confusion Matrix - Decision Tree')
+    
+```
+
+#### Confusion Matrix Table
+
+```{r conf_table_3}
+
+# show confusion matrix
+confusionMatrix(y_test, preds)$table %>%
+    as.data.frame.matrix() %>%
+    kable("html") %>%
+    kable_styling(bootstrap_options = c('striped'), font_size = 8) %>%
+    scroll_box(height = "400px")
+
+```
+
+
+#### Tree Plot
+
+
+
+```{r tree_plot_3}
+
+rpart.plot(dtree$finalModel)
+
+```
+
+#### CV Plot
+
+```{r}
+
+plot(dtree)
+
+```
+
+
+###
+
+
+
+## Iteration 5: Ensembling {#ensemble}
+
+
+
+```{r random_forest}
+
+# Train the decision tree model
+set.seed(123)
+rfmodel <- train(x = x_train,
+                 y = y_train,
+                 method = 'rf',
+                 tuneLength = 3,
+                 ntree = 100,
+                 trControl = tr_control)
+
+```
+
+```{r predictions_4}
+
+# make predictions using test set
+preds <- predict(rfmodel, newdata = x_test)
+
+# calculate accuracy on test set
+test_set_acc <- sum(y_test == preds)/length(preds)
+print(paste(c("Accuracy:" , round(test_set_acc, 4))))
+
+```
+
+
+
+```{r resample_3}
+
+print(rfmodel$resample)
+```
+
+
+
+### Results {.tabset}
+
+#### Confusion Matrix Heatmap
+
+```{r conf_heatmap_4}
+
+confusionMatrix(y_test, preds)$table %>%
+    prop.table(margin = 1) %>%
+    as.data.frame.matrix() %>%
+    rownames_to_column(var = 'actual') %>%
+    gather(key = 'prediction', value = 'freq',-actual) %>%
+    ggplot(aes(x = actual, y = prediction, fill = freq)) +
+    geom_tile() +
+    geom_text(aes(label = round(freq, 2)), size = 3, color = 'gray20') + 
+    scale_fill_gradient(low = 'yellow', high = 'red', limits = c(0,1), name = 'Relative Frequency') + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle('Confusion Matrix - Random Forest (100 Trees)')
+    
+```
+
+#### Confusion Matrix Table
+
+```{r conf_table_4}
+
+# show confusion matrix
+confusionMatrix(y_test, preds)$table %>%
+    as.data.frame.matrix() %>%
+    kable("html") %>%
+      kable_styling(bootstrap_options = c('striped'), font_size = 8) %>%
+  scroll_box(height = "400px")
+
+```
+
+#### CV Results
+
+```{r}
+
+plot(rfmodel)
+
+```
+
+### Iteration 6: Boosting {#boosting}
+
+
+
+```{r}
+
+fires$BURN_TIME <- fires$CONT_DATE - fires$DISCOVERY_DATE
+
+```
+
+
+```{r}
+
+# features to use
+features <- c('FIRE_YEAR', 'FIRE_SIZE', 'DISCOVERY_DOY', 'LATITUDE', 'LONGITUDE', 'BURN_TIME')
+
+x_train <- as.data.frame(fires[train_index, features])
+y_train <- fires$STAT_CAUSE_DESCR[train_index]
+
+x_test <- as.data.frame(fires[test_index, features])
+y_test <- fires$STAT_CAUSE_DESCR[test_index]
+
+
+```
+
+
+```{r xgboost}
+
+tr_control <- trainControl(
+    method = 'cv',
+    number = 2,
+    verboseIter = FALSE,
+    allowParallel = TRUE)
+    
+tune_grid <- expand.grid(
+    nrounds = c(100),
+    max_depth = c(8),
+    eta = c(0.1),
+    gamma = c(0.01),
+    colsample_bytree = c(0.75),
+    subsample = c(0.5),
+    min_child_weight = c(0))
+
+# Train the decision tree model
+set.seed(123)
+xgbmodel <- train(
+    x = x_train,
+    y = y_train,
+    method = 'xgbTree',
+    trControl = tr_control,
+    tuneGrid = tune_grid)
+
+```
+
+```{r predictions_5}
+
+# make predictions using test set
+preds <- predict(xgbmodel, newdata = x_test)
+
+# calculate accuracy on test set
+test_set_acc <- sum(y_test == preds)/length(preds)
+print(paste(c("Accuracy:" , round(test_set_acc, 4))))
+
+```
+
+
+```{r resample_4}
+
+print(xgbmodel$resample)
+
+```
+
+
+### Results {.tabset}
+
+#### Confusion Matrix Heatmap
+
+```{r conf_heatmap_5}
+
+confusionMatrix(y_test, preds)$table %>%
+    prop.table(margin = 1) %>%
+    as.data.frame.matrix() %>%
+    rownames_to_column(var = 'actual') %>%
+    gather(key = 'prediction', value = 'freq',-actual) %>%
+    ggplot(aes(x = actual, y = prediction, fill = freq)) +
+    geom_tile() +
+    geom_text(aes(label = round(freq, 2)), size = 3, color = 'gray20') + 
+    scale_fill_gradient(low = 'yellow', high = 'red', limits = c(0,1), name = 'Relative Frequency') + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ggtitle('Confusion Matrix - xgboost')
+    
+```
+
+#### Confusion Matrix Table
+
+```{r conf_table_5}
+
+# show confusion matrix
+confusionMatrix(y_test, preds)$table %>%
+    as.data.frame.matrix() %>%
+    kable("html") %>%
+      kable_styling(bootstrap_options = c('striped'), font_size = 8) %>%
+  scroll_box(height = "400px")
+
+```
+
+#### CV Results
+
+```{r}
+
+#plot(xgbmodel)
+
+```
